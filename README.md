@@ -56,6 +56,10 @@ subset `train_sub`. Validation (10k) and test (10k) are the full sets.
 | Data loading + splits | < 1 s |
 | Part 1 (LR + k-NN complexity grids, 14 fits) | ~25 s |
 | Part 2 MLP training (60 epochs each): small / baseline / large | ~2 s / ~5 s / ~19 s per run |
+| Part 3 (5 regulariser runs + 4 extra seed runs) | ~45 s |
+| **Whole notebook from scratch (no cache), Parts 0–3** | **~1 min 45 s** |
+
+Retraining from an empty cache reproduces every run exactly (checked: identical loss and accuracy histories).
 
 ## Repository layout
 

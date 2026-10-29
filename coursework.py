@@ -642,3 +642,177 @@ for (i, v), hh in zip(lr_ids, lr_hists):
 #      so these results apply to μ = 0.9 and batch 128 only.
 #   3. No learning-rate schedule is used. A decaying schedule could stabilise η = 0.25 late in training.
 #   4. Single seed; a "max over noisy epochs" checkpoint rewards noisy runs.
+
+# %% [markdown]
+# ---
+# ## Part 3 — Overfitting, regularisation and randomness
+#
+# **Recognising overfitting.** In Part 2 the unregularised baseline already overfits: after ~epoch 15 the
+# training loss keeps falling towards 0 while the validation loss *rises* (0.40 → 0.61). The network
+# memorises the 10k training images and becomes over-confident on validation images.
+#
+# ### 3.1 Regularisation strategies (explored on validation, seed 0)
+#
+# The architecture (256-128) and the training recipe stay fixed; only the regulariser changes.
+#
+# | Strategy | Implementation | Settings | How it should help |
+# |---|---|---|---|
+# | **None** (baseline) | – | – | reference |
+# | **L2 weight decay** | adds `weight_decay * w` to each weight gradient in `sgd_momentum_step` (= gradient of $\frac{\lambda}{2}\lVert w\rVert^2$), weights only, not biases | λ ∈ {1e-4, 5e-4, 2e-3} | keeps weights small → smoother function, less extreme logits (less over-confidence) |
+# | **Dropout** | `nn.Dropout(p)` after each hidden ReLU; active in `model.train()`, off in `model.eval()` | p ∈ {0.2, 0.5} | randomly removes units during training, so the network cannot rely on fragile co-adapted features; like averaging many thinned networks |
+# | **Early stopping** | the checkpoint rule (best validation epoch) applied to the *unregularised* run | – | stops before memorisation; compare checkpoint vs final epoch |
+#
+# **Comparable loss definitions.** All plotted losses are the *data* cross-entropy only (the L2 penalty is
+# not added), measured in `eval` mode (dropout off) on the full training and validation sets after each
+# epoch, so the regularised and unregularised curves measure the same quantity.
+
+# %%
+reg_ids = [("E2.1_baseline", {}, "none"),
+           ("E3.1_wd1e-4", {"weight_decay": 1e-4}, "L2 λ=1e-4"),
+           ("E3.1_wd5e-4", {"weight_decay": 5e-4}, "L2 λ=5e-4"),
+           ("E3.1_wd2e-3", {"weight_decay": 2e-3}, "L2 λ=2e-3"),
+           ("E3.1_drop0.2", {"dropout": 0.2}, "dropout p=0.2"),
+           ("E3.1_drop0.5", {"dropout": 0.5}, "dropout p=0.5")]
+reg_hists = [mlp_run(i, **o)[1] for i, o, _ in reg_ids]
+reg_labels = [lab for _, _, lab in reg_ids]
+reg_table = summarise(reg_hists, reg_labels).drop(columns=["params"])
+reg_table["min val loss"] = [np.nanmin(h["val_loss"]) for h in reg_hists]
+reg_table["final gap (train−val acc)"] = reg_table["final train acc"] - reg_table["final val acc"]
+for (i, o, lab), h in zip(reg_ids[1:], reg_hists[1:]):
+    log_experiment(id=i, task="3.1", question="Which regulariser best reduces overfitting of the 256-128 MLP?",
+                   hypothesis="Regularisation lowers final val loss and the train-val gap",
+                   changed_variable=lab, fixed_conditions="256-128, lr 0.05, mom 0.9, batch 128, 60 ep",
+                   split="fit train_sub / eval val", seed=0, configuration=json.dumps(h["config"]),
+                   metric="val acc (checkpoint & final), final val loss",
+                   result=f"ckpt {h['best_val_acc']:.4f}; final {h['val_acc'][-1]:.4f}; final val loss {h['val_loss'][-1]:.3f}",
+                   output_path=f"results/runs/{i}.json")
+reg_table
+
+# %%
+plot_curves([reg_hists[0], reg_hists[2], reg_hists[3], reg_hists[4], reg_hists[5]],
+            [reg_labels[0], reg_labels[2], reg_labels[3], reg_labels[4], reg_labels[5]],
+            "Figure 3.1 (addresses 3.1): regularisation strategies, 256-128 MLP, seed 0; "
+            "losses = data cross-entropy in eval mode; ★ = checkpoint epoch", "fig3_1_regularisers")
+
+# %% [markdown]
+# **Table 3.1 (addresses 3.1).** Regularisation strategies (validation, seed 0). The λ = 1e-4 run is in the
+# table but omitted from Figure 3.1 for readability.
+#
+# **Analysis 3.1 (what regularisation changed).**
+# * *Observation: overfitting is reduced.* Every regulariser lowers the final validation loss (0.611 with
+#   none → 0.40–0.56) and narrows the final train–validation accuracy gap (0.105 → 0.04–0.10). In Figure 3.1b
+#   the unregularised validation loss climbs after epoch ~20, while the L2 λ ≥ 5e-4 and dropout curves
+#   stay flat around 0.40–0.45. Training loss is correspondingly higher (Figure 3.1a): the regulariser stops
+#   the network from driving training loss to zero.
+# * *Observation: accuracy is not improved.* Checkpoint validation accuracy for none / L2 5e-4 / dropout 0.2
+#   is 0.873 / 0.872 / 0.872, which are indistinguishable. Too much regularisation **hurts** (L2 2e-3: 0.862;
+#   dropout 0.5: 0.854): training accuracy falls to ~0.90, i.e. the model starts to *underfit*. λ = 1e-4 is
+#   too weak to change much.
+# * *Interpretation.* Overfitting in this model shows up mainly as **over-confidence** (huge logits on
+#   training images, confident mistakes on validation images), which cross-entropy punishes heavily, rather
+#   than as many more wrong argmax decisions. L2 shrinks weights, so logits stay moderate; dropout forces
+#   redundant features, so no single unit dominates. Both make the network's probabilities better
+#   calibrated, which is what the validation loss measures.
+# * *Early stopping* is also a regulariser here: the unregularised checkpoint (epoch 27, 0.873) already
+#   captures the best accuracy, and its validation loss near that point (~0.42) is far below its final 0.611.
+#   For accuracy alone, early stopping is as good as L2 or dropout; the explicit regularisers matter if we
+#   need reliable probabilities (e.g. the threshold decisions of Part 1.5) or cannot afford a validation-based stop.
+# * *Selection.* Following the rule written in the next cell (highest checkpoint validation accuracy,
+#   excluding the baseline), **dropout p = 0.2** is carried into 3.2; L2 λ = 5e-4 was a near-tie.
+
+# %% [markdown]
+# ### 3.2 Randomness: three seeds for the two main configurations
+#
+# The two configurations behind the main conclusion, **unregularised** vs **the regulariser selected on
+# validation in 3.1**, are trained with seeds 0, 1, 2 (seed 0 runs are reused). The data split
+# (seed 708) and the 10k fitting subset are fixed.
+#
+# **Sources of randomness controlled by the seed:** (1) weight initialisation, (2) minibatch order,
+# (3) dropout masks. **Fixed:** data split and subsets, the order of validation images, all hyperparameters.
+# **Not controlled:** floating-point non-associativity in multi-threaded CPU kernels (tiny differences
+# between machines are possible).
+
+# %%
+# Selection rule (fixed before running seeds 1 and 2): the regulariser with the highest checkpoint
+# validation accuracy in Table 3.1, excluding the baseline.
+sel_label = reg_table.drop(index="none")["val acc (checkpoint)"].idxmax()
+sel_id, sel_over, _ = next(r for r in reg_ids if r[2] == sel_label)
+print("Selected regulariser on validation:", sel_label, sel_over)
+
+SEEDS = [0, 1, 2]
+seed_runs = {"none": [], sel_label: []}
+for sd in SEEDS:
+    seed_runs["none"].append(mlp_run("E2.1_baseline" if sd == 0 else f"E3.2_none_s{sd}", seed=sd)[1])
+    seed_runs[sel_label].append(mlp_run(sel_id if sd == 0 else f"E3.2_{sel_id.split('_')[1]}_s{sd}",
+                                        seed=sd, **sel_over)[1])
+
+rows = []
+for name, hs in seed_runs.items():
+    for sd, h in zip(SEEDS, hs):
+        rows.append({"config": name, "seed": sd, "val acc (checkpoint)": h["best_val_acc"],
+                     "best epoch": h["best_epoch"], "final val acc": h["val_acc"][-1],
+                     "final val loss": h["val_loss"][-1], "min val loss": np.nanmin(h["val_loss"]),
+                     "final train acc": h["train_acc"][-1],
+                     "final gap": h["train_acc"][-1] - h["val_acc"][-1]})
+seed_df = pd.DataFrame(rows)
+metrics = ["val acc (checkpoint)", "final val acc", "final val loss", "min val loss", "final gap"]
+agg = seed_df.groupby("config", sort=False)[metrics].agg(["mean", lambda x: x.std(ddof=1)])
+agg.columns = [f"{m} {'mean' if s == 'mean' else 'std'}" for m, s in agg.columns]
+display(seed_df.set_index(["config", "seed"]).round(4))
+agg.T.round(4)
+
+# %% [markdown]
+# **Table 3.2 (addresses 3.2).** Top: every seed. Bottom: mean and **sample** standard deviation (ddof = 1)
+# over the 3 seeds. Validation set, 10,000 images.
+
+# %%
+fig, axes = plt.subplots(1, 3, figsize=(14, 3.8))
+for (name, hs), st in zip(seed_runs.items(), STYLES):
+    for key, ax in zip(["train_loss", "val_loss", "val_acc"], axes):
+        arr = np.array([h[key] for h in hs]); ep = np.arange(1, arr.shape[1] + 1)
+        line, = ax.plot(ep, arr.mean(0), label=f"{name} (mean of 3 seeds)", markevery=10, ms=4, **st)
+        ax.fill_between(ep, arr.min(0), arr.max(0), alpha=0.2, color=line.get_color())
+for ax, t in zip(axes, ["(a) training loss (CE)", "(b) validation loss (CE)", "(c) validation accuracy"]):
+    ax.set_title(t); ax.set_xlabel("epoch")
+axes[0].legend(fontsize=7)
+fig.suptitle("Figure 3.2 (addresses 3.1, 3.2): unregularised vs selected regulariser over seeds 0, 1, 2. "
+             "Line = mean, band = min–max across seeds; validation set", fontsize=10)
+fig.tight_layout(); savefig(fig, "fig3_2_seeds"); plt.show()
+
+# %%
+diff = (seed_df[seed_df.config == sel_label]["val acc (checkpoint)"].values
+        - seed_df[seed_df.config == "none"]["val acc (checkpoint)"].values)
+print("Paired difference in checkpoint val acc (regularised − none) per seed:", np.round(diff, 4),
+      f"| mean {diff.mean():+.4f}, sample std {diff.std(ddof=1):.4f}")
+diff_f = (seed_df[seed_df.config == sel_label]["final val loss"].values
+          - seed_df[seed_df.config == "none"]["final val loss"].values)
+print("Paired difference in final val loss (regularised − none) per seed:", np.round(diff_f, 3))
+log_experiment(id="E3.2", task="3.2", question="Is the regularisation effect larger than seed variability?",
+               hypothesis="Final val loss improvement is consistent across seeds; accuracy gain is small",
+               changed_variable=f"none vs {sel_label}, seeds {SEEDS}",
+               fixed_conditions="split seed 708, train_sub, 256-128, lr 0.05, 60 ep",
+               split="fit train_sub / eval val", seed=str(SEEDS),
+               configuration=f"selected: {sel_over}", metric="val acc (checkpoint), final val loss; mean ± sample std",
+               result="; ".join(f"{c}: {agg.loc[c, 'val acc (checkpoint) mean']:.4f} ± {agg.loc[c, 'val acc (checkpoint) std']:.4f}"
+                                for c in agg.index),
+               output_path="figures/fig3_2_seeds.png");
+
+# %% [markdown]
+# **Analysis 3.2 (randomness).**
+# * *Observation.* Across seeds 0–2, checkpoint validation accuracy is **0.872 ± 0.001** (none) vs
+#   **0.871 ± 0.001** (dropout 0.2) (mean ± sample std). The paired difference per seed is −0.0009, 0.0000,
+#   −0.0034, so no difference can be claimed. Final validation loss is **0.617 ± 0.026** (none) vs
+#   **0.432 ± 0.007** (dropout): the reduction (0.17–0.22) is about **7× the seed standard deviation** and
+#   has the same sign for all three seeds. The final train–val gap is 0.103 ± 0.003 vs 0.071 ± 0.0005.
+# * *Interpretation.* Seed randomness (initialisation, minibatch order, dropout masks) moves validation
+#   accuracy by about ±0.1–0.3 points: about 10–30 images. Any accuracy difference of that size between two
+#   configurations in Parts 2–3 (e.g. baseline vs large network, +0.4 points from one seed) should be treated
+#   as **not established**. Randomness affects the unregularised model more in the *late* epochs: its
+#   validation-loss band widens after epoch 30 (Figure 3.2b), because which training images get memorised
+#   depends on the random path taken. Dropout's band stays narrow.
+#   Randomness also changes **which epoch** is selected (none: epochs 19, 27, 46), so the checkpoint epoch
+#   itself is a noisy quantity.
+# * *Conclusion (bounded).* On this data (10k training images, 256-128 MLP, 60 epochs, momentum SGD),
+#   dropout 0.2 reliably reduces over-confidence and the generalisation gap, but does not improve validation
+#   accuracy relative to early stopping. Three seeds give a rough estimate of the spread, not statistical
+#   proof; a confidence interval would need more seeds.

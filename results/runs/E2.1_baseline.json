@@ -312,7 +312,7 @@
  "best_epoch": 27,
  "best_val_acc": 0.8729,
  "n_params": 235146,
- "train_time_s": 4.8068389892578125,
+ "train_time_s": 4.910904169082642,
  "config": {
   "hidden": [
    256,
