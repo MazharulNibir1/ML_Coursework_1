@@ -54,6 +54,7 @@ subset `train_sub`. Validation (10k) and test (10k) are the full sets.
 | Step | Approx. time |
 |---|---|
 | Data loading + splits | < 1 s |
+| Part 1 (LR + k-NN complexity grids, 14 fits) | ~25 s |
 
 ## Repository layout
 
