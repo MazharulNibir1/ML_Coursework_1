@@ -434,3 +434,211 @@ log_experiment(id="E1.5", task="1.5", question="How does the threshold trade mis
 #   creates many false alarms.
 # * *Caveat.* The threshold is chosen on validation. Its cost on unseen data will be measured once in the
 #   final test evaluation, and the 5:1 cost ratio is an assumption of the scenario, not a measured fact.
+
+# %% [markdown]
+# ---
+# ## Part 2 — Neural networks: architecture and learning
+#
+# ### 2.1 Baseline MLP (trained from scratch)
+#
+# All code is in `src/mlp.py`. The parts below are printed so the model, loss, gradient update,
+# training loop and validation loop can be read directly.
+#
+# | Item | Baseline choice | Why |
+# |---|---|---|
+# | Input | 784 pixels in [0, 1] (fixed /255 scaling) | same input as the classical models |
+# | Architecture | 784 → **256** → ReLU → **128** → ReLU → 10 logits | two hidden layers let it learn non-linear combinations of pixels, which LR cannot; the funnel shape compresses to a 128-d representation used in Part 5 |
+# | Loss | cross-entropy on softmax(logits) | the negative log-likelihood for a categorical label; same loss as LR, so differences come from the architecture |
+# | Optimiser | mini-batch SGD with momentum, **lr = 0.05**, momentum 0.9, batch 128, **written by hand** | simple, well understood; momentum smooths noisy minibatch gradients |
+# | Epochs | 60 (≈ 4,700 updates) | long enough for training loss to approach zero, so overfitting becomes visible |
+# | Initialisation | Kaiming-normal weights, zero biases | keeps activation scale stable through ReLU layers |
+# | Checkpoint rule | keep the epoch with the **highest validation accuracy** (earliest on ties); all 60 epochs are still run so full curves are recorded | selection uses validation only (R1) |
+# | Regularisation | none (no weight decay, no dropout) | an unregularised baseline for Part 3 |
+# | Seed | 0: controls initialisation, minibatch order and dropout masks | the split is fixed separately (seed 708) |
+#
+# **How it predicts.** Each layer computes $h = \mathrm{ReLU}(Wh_{prev} + b)$. The last layer outputs 10 scores
+# (logits) $z$; $p(c\mid x) = e^{z_c}/\sum_j e^{z_j}$ and the prediction is $\arg\max_c z_c$.
+#
+# **How it learns.** For each minibatch: forward pass → cross-entropy loss → `loss.backward()` runs
+# backpropagation, which applies the chain rule layer by layer from the loss back to the input and gives
+# $\partial L/\partial w$ for every weight → `sgd_momentum_step` updates $v \leftarrow \mu v + g$,
+# $w \leftarrow w - \eta v$. After every epoch, a validation loop measures loss and accuracy with gradients off.
+
+# %%
+import inspect
+from src import mlp as mlp_mod
+from src.mlp import BASELINE, MLP, count_params, predict_proba, run
+
+for fn in [mlp_mod.MLP, mlp_mod.sgd_momentum_step, mlp_mod.evaluate, mlp_mod.train]:
+    print(inspect.getsource(fn))
+
+# %%
+def mlp_run(exp_id, **overrides):
+    cfg = {**BASELINE, **overrides}
+    model, hist = run(exp_id, cfg, X_tr, y_tr, X_val, y_val)
+    return model, hist
+
+t0 = time.time()
+base_model, base_hist = mlp_run("E2.1_baseline")
+print(base_model)
+print(f"Trainable parameters: {count_params(base_model):,}  "
+      f"(784·256+256 + 256·128+128 + 128·10+10 = {784*256+256 + 256*128+128 + 128*10+10:,})")
+print(f"Best validation accuracy {base_hist['best_val_acc']:.4f} at epoch {base_hist['best_epoch']}; "
+      f"training time {base_hist['train_time_s']:.1f}s (CPU)")
+log_experiment(id="E2.1", task="2.1", question="How well does a from-scratch MLP do on Fashion-MNIST?",
+               hypothesis="Better than LR (0.844) because hidden layers learn non-linear features",
+               changed_variable="- (baseline)", fixed_conditions="see BASELINE in src/mlp.py",
+               split="fit train_sub / select+eval val", seed=0, configuration=json.dumps(BASELINE),
+               metric="val accuracy at best epoch", result=f"{base_hist['best_val_acc']:.4f} @ ep {base_hist['best_epoch']}",
+               output_path="results/runs/E2.1_baseline.json");
+
+# %%
+STYLES = [dict(marker="o", ls="-"), dict(marker="s", ls="--"), dict(marker="^", ls="-."),
+          dict(marker="D", ls=":"), dict(marker="v", ls=(0, (5, 1)))]
+
+def plot_curves(hists, labels, title, fname):
+    """Four panels: train loss, validation loss, train accuracy, validation accuracy.
+    Lines differ by marker and dash pattern (not colour alone). A star marks the checkpoint epoch."""
+    fig, axes = plt.subplots(1, 4, figsize=(15, 3.6))
+    panels = [("train_loss", "(a) training loss (CE)"), ("val_loss", "(b) validation loss (CE)"),
+              ("train_acc", "(c) training accuracy"), ("val_acc", "(d) validation accuracy")]
+    for ax, (key, name) in zip(axes, panels):
+        for h, lab, st in zip(hists, labels, STYLES):
+            ep = np.arange(1, len(h[key]) + 1)
+            line, = ax.plot(ep, h[key], label=lab, markevery=10, ms=4, **st)
+            if key == "val_acc":
+                ax.plot(h["best_epoch"], h["best_val_acc"], "*", ms=12, color=line.get_color(), mec="k")
+        ax.set_title(name); ax.set_xlabel("epoch")
+        if "loss" in key: ax.set_ylim(0, min(2.0, ax.get_ylim()[1]))
+    axes[0].legend(fontsize=7)
+    fig.suptitle(title); fig.tight_layout(); savefig(fig, fname); plt.show()
+
+def summarise(hists, labels):
+    rows = []
+    for h, lab in zip(hists, labels):
+        b = h["best_epoch"] - 1
+        rows.append({"config": lab, "params": h["n_params"], "best epoch": h["best_epoch"],
+                     "val acc (checkpoint)": h["best_val_acc"], "train acc (checkpoint)": h["train_acc"][b],
+                     "min train loss": np.nanmin(h["train_loss"]), "final train acc": h["train_acc"][-1],
+                     "final val acc": h["val_acc"][-1], "final val loss": h["val_loss"][-1],
+                     "train time (s)": h["train_time_s"]})
+    return pd.DataFrame(rows).set_index("config")
+
+# %% [markdown]
+# ### 2.2 Experiment A: capacity
+#
+# **Changed variable:** hidden-layer widths (depth fixed at two hidden layers).
+# **Fixed:** everything else in the baseline recipe (optimiser, lr, batch, 60 epochs, init, seed 0, data).
+#
+# * Small: 784 → 32 → 16 → 10 (~10× fewer parameters)
+# * Baseline: 784 → 256 → 128 → 10
+# * Large: 784 → 1024 → 512 → 10 (~6× more parameters)
+#
+# *Hypothesis:* more capacity → lower training loss; validation improves only while the extra capacity
+# captures real structure, and then the train–validation gap grows.
+
+# %%
+cap_ids = [("E2.2_small", [32, 16]), ("E2.1_baseline", [256, 128]), ("E2.2_large", [1024, 512])]
+cap_hists = [mlp_run(i, hidden=h)[1] for i, h in cap_ids]
+cap_labels = [f"{'-'.join(map(str, h))} ({hh['n_params']:,} params)" for (_, h), hh in zip(cap_ids, cap_hists)]
+plot_curves(cap_hists, cap_labels, "Figure 2.1 (addresses 2.2): capacity. Same recipe, seed 0; "
+            "fit train_sub (10k), evaluate validation (10k); ★ = checkpoint epoch", "fig2_1_capacity")
+cap_table = summarise(cap_hists, cap_labels); cap_table
+
+# %%
+for (i, h), hh in zip(cap_ids, cap_hists):
+    if i != "E2.1_baseline":
+        log_experiment(id=i, task="2.2",
+                       question="What does capacity do to training fit and validation performance?",
+                       hypothesis="More capacity lowers training loss; validation gains shrink",
+                       changed_variable=f"hidden widths {h}", fixed_conditions="baseline recipe, seed 0",
+                       split="fit train_sub / eval val", seed=0, configuration=json.dumps(hh["config"]),
+                       metric="val accuracy at checkpoint; min train loss",
+                       result=f"val {hh['best_val_acc']:.4f}, min train loss {np.nanmin(hh['train_loss']):.3f}",
+                       output_path=f"results/runs/{i}.json")
+
+# %% [markdown]
+# **Table 2.1 (addresses 2.2).** Capacity comparison (validation, seed 0). "Checkpoint" = epoch of best
+# validation accuracy.
+#
+# **Analysis 2.2 (capacity).**
+# * *Observation (training fit).* Training loss is ordered by capacity throughout training (Figure 2.1a):
+#   minimum training loss 0.144 (small) → 0.057 (baseline) → 0.029 (large); final training accuracy
+#   0.942 → 0.972 → 0.981.
+# * *Observation (validation).* Validation accuracy at the checkpoint is 0.856 → 0.873 → 0.877. Going from
+#   26k to 235k parameters (9×) gained **+1.7 points**; going from 235k to 1.33M (5.7×) gained only
+#   **+0.4 points** (≈ 40 images out of 10,000). All three MLPs beat logistic regression (0.844) and k-NN (0.822).
+# * *Observation (overfitting).* For **all three** sizes, validation loss reaches its minimum (~0.40) around
+#   epochs 10–20 and then rises to ~0.6 by epoch 60, while training loss keeps falling (Figure 2.1a vs b).
+#   Validation accuracy stays roughly flat. The networks become over-confident on the validation images they
+#   get wrong, which raises the loss without changing many argmax decisions.
+# * *Interpretation.* Extra capacity mainly improved **training fit**. It improved validation performance
+#   only from small to baseline; beyond that, the gain is smaller than the epoch-to-epoch fluctuation of the
+#   validation curve (±1 point, Figure 2.1d), so it is not convincing from one seed. Part 3 measures the
+#   seed-to-seed spread for scale.
+# * *Capacity vs optimisation.* "Capacity" is what a network *could* fit; the training curve shows what the
+#   optimiser *did* fit within this budget. All three runs trained stably (no divergence), and the larger
+#   networks reached lower training loss with the *same* number of updates, so the training-fit ordering is
+#   consistent with capacity. However, the small network's training loss was still falling at epoch 60, so
+#   part of its gap may be **under-optimisation** rather than a hard capacity limit. Larger networks are
+#   also often *easier* to optimise. To separate the two, I would train the small model to convergence
+#   (more epochs or a tuned learning rate) and check whether its training loss plateaus above the others'.
+# * *Caveat.* Picking the maximum of a noisy validation curve is optimistically biased; noisier runs get
+#   more "lucky" peaks. Wall-clock cost grows with size: 2.0 s → 4.8 s → 18.6 s.
+
+# %% [markdown]
+# ### 2.3 Experiment B: optimisation — learning rate
+#
+# **Changed variable:** learning rate η ∈ {0.005, **0.05** (baseline), 0.25}, everything else fixed
+# (architecture 256-128, momentum 0.9, batch 128, 60 epochs, seed 0).
+#
+# **Why learning rate:** it is the single setting that most directly controls *how* gradient descent moves
+# through the loss surface: the step size of every update. A 10× smaller and a 5× larger value show the
+# two failure modes, too slow and unstable, around the baseline. With momentum 0.9 the effective step is
+# about η/(1−0.9) = 10η, so η = 0.25 is aggressive.
+#
+# *Hypothesis:* η = 0.005 learns smoothly but slowly (still improving at epoch 60); η = 0.25 is noisy or
+# unstable; the baseline sits in between.
+
+# %%
+lr_ids = [("E2.3_lr0.005", 0.005), ("E2.1_baseline", 0.05), ("E2.3_lr0.25", 0.25)]
+lr_hists = [mlp_run(i, lr=v)[1] for i, v in lr_ids]
+lr_labels = [f"lr = {v}" for _, v in lr_ids]
+plot_curves(lr_hists, lr_labels, "Figure 2.2 (addresses 2.3): learning rate. Architecture 256-128, seed 0; "
+            "fit train_sub, evaluate validation; ★ = checkpoint epoch", "fig2_2_learning_rate")
+lr_table = summarise(lr_hists, lr_labels); lr_table
+
+# %%
+for (i, v), hh in zip(lr_ids, lr_hists):
+    if i != "E2.1_baseline":
+        log_experiment(id=i, task="2.3", question="How does the learning rate change training dynamics?",
+                       hypothesis="small lr slow but smooth; large lr unstable",
+                       changed_variable=f"lr={v}", fixed_conditions="256-128, momentum 0.9, batch 128, 60 ep, seed 0",
+                       split="fit train_sub / eval val", seed=0, configuration=json.dumps(hh["config"]),
+                       metric="val accuracy at checkpoint; loss curves",
+                       result=f"val {hh['best_val_acc']:.4f} @ ep {hh['best_epoch']}",
+                       output_path=f"results/runs/{i}.json")
+
+# %% [markdown]
+# **Table 2.2 (addresses 2.3).** Learning-rate comparison (validation, seed 0).
+#
+# **Analysis 2.3 (learning rate).**
+# * *Observation.* **η = 0.005**: smooth, monotone curves, but slow; the training loss (0.155 at the end) is
+#   still falling at epoch 60 and the best validation epoch is 54 (0.869). **η = 0.05**: the fastest fit;
+#   best validation 0.873 already at epoch 27, after which validation loss rises (overfitting).
+#   **η = 0.25**: unstable; the training loss spikes repeatedly and training accuracy *collapses* from
+#   ~0.80 to 0.56 by epoch 60. Its best validation accuracy is only 0.785 (epoch 17).
+# * *Interpretation.* The learning rate scales every update. Too small: each step barely reduces the loss,
+#   so the model is under-trained within a fixed budget. Too large: with momentum 0.9 the effective step
+#   (~10η = 2.5) overshoots the minima of the loss surface, so updates bounce out of good regions instead of
+#   settling. The training loss going *up* is the signature of an optimisation failure, not of capacity or
+#   overfitting.
+# * Interestingly, η = 0.005 ends with a much lower validation loss (0.417 vs 0.611) than the baseline. It
+#   has fitted the training set less tightly, so slow optimisation acts like **implicit early stopping**.
+# * *Fairness caveats specific to the learning rate.*
+#   1. The **fixed 60-epoch budget** favours larger rates: η = 0.005 has not converged, and with ~10× more
+#      epochs it might match or beat the baseline. The comparison is "under this budget", not "in general".
+#   2. η interacts with **momentum and batch size** (effective step ≈ η/(1−μ), gradient noise ∝ 1/batch),
+#      so these results apply to μ = 0.9 and batch 128 only.
+#   3. No learning-rate schedule is used. A decaying schedule could stabilise η = 0.25 late in training.
+#   4. Single seed; a "max over noisy epochs" checkpoint rewards noisy runs.
